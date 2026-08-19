@@ -60,6 +60,7 @@
   <div class="row"><span class="k">VOXELS</span><span class="v" id="vox">—</span></div>
   <div class="sub" id="vox-detail"></div>
 </div>
+<div id="kata-hud" class="hud" style="display:none; top:44px; left:16px; font-size:12px;"></div>
 <div id="help" class="hud">DRAG · ORBIT&nbsp;&nbsp;&nbsp;SCROLL · ZOOM&nbsp;&nbsp;&nbsp;IDLE · AUTO-ORBIT</div>
 
 <script type="module">
@@ -1145,6 +1146,125 @@ export function updateScene(S, t, dt) {
 }
 
 /* ============================================================================
+   KATAMARI MODE . a rolling-ball collect-everything game
+   Pure simulation (no THREE, no DOM): exported so it can be unit-tested.
+   ========================================================================= */
+const KATA = {
+  baseRadius: 1.1,
+  maxSpeed: 24,
+  accel: 46,
+  turnLerp: 10,
+  drag: 3.2,
+  cameraLerp: 5,
+  camHeight: 15,
+  camBack: 26,
+  spawnCount: 260,
+};
+
+export function createKatamari(hAt) {
+  let sx = -8, sz = 4;
+  for (let r = 0; r < 24 && hAt(sx, sz) < 0; r++) { sx = (rng() * 60 - 30) | 0; sz = (rng() * 60 - 30) | 0; }
+  return {
+    pos: { x: sx, z: sz },
+    vel: { x: 0, z: 0 },
+    heading: 0,
+    spin: 0,
+    radius: KATA.baseRadius,
+    attached: [],
+    collected: 0,
+    totalVolume: 0,
+    cameraYaw: 0,
+  };
+}
+
+/** deterministic per-step update; input = {mx, mz} in [-1,1] */
+export function katamariStep(K, input, hAt, dt) {
+  const p = K.pos, v = K.vel;
+  // camera-relative steering: fwd = (cosY, sinY), screen-right = (sinY, -cosY)
+  const cy = Math.cos(K.cameraYaw), sy = Math.sin(K.cameraYaw);
+  const wx = input.mx * sy - input.mz * cy;
+  const wz = -input.mx * cy - input.mz * sy;
+  const wantsMove = Math.hypot(wx, wz) > 1e-4;
+  let tx = 0, tz = 0;
+  if (wantsMove) {
+    const speed = Math.min(KATA.maxSpeed * (0.45 + 0.55 * Math.min(1, K.radius / 6)), KATA.maxSpeed);
+    tx = wx * speed; tz = wz * speed;
+    const target = Math.atan2(tz, tx);
+    let d = target - K.heading;
+    while (d > Math.PI) d -= TAU;
+    while (d < -Math.PI) d += TAU;
+    K.heading += d * Math.min(1, KATA.turnLerp * dt);
+  }
+  v.x += (tx - v.x) * Math.min(1, KATA.drag * dt);
+  v.z += (tz - v.z) * Math.min(1, KATA.drag * dt);
+  p.x += v.x * dt; p.z += v.z * dt;
+
+  const rEdge = 68 - K.radius;
+  const rr = Math.hypot(p.x, p.z);
+  if (rr > rEdge) {
+    const f = rEdge / rr;
+    p.x *= f; p.z *= f;
+    v.x *= 0.4; v.z *= 0.4;
+  }
+
+  const moved = Math.hypot(v.x, v.z) * dt;
+  K.spin += moved / Math.max(0.4, K.radius);
+
+  let sum = 0, n = 0;
+  const R = Math.min(3, Math.max(1, Math.round(K.radius)));
+  for (let dx = -R; dx <= R; dx++) for (let dz = -R; dz <= R; dz++) {
+    const h = hAt(Math.round(p.x) + dx, Math.round(p.z) + dz);
+    if (h > 0) { sum += h; n++; }
+  }
+  K.y = n ? (sum / n) + K.radius : 8 + K.radius;
+
+  const camTarget = K.heading;
+  let cd = camTarget - K.cameraYaw;
+  while (cd > Math.PI) cd -= TAU;
+  while (cd < -Math.PI) cd += TAU;
+  K.cameraYaw += cd * Math.min(1, KATA.cameraLerp * dt);
+
+  return K;
+}
+
+/** attach a blob: van-der-Corput / golden-angle lattice for uniform sphere coverage */
+function vdc(n) { let r = 0, f = 0.5; while (n) { if (n & 1) r += f; n >>>= 1; f *= 0.5; } return r; }
+export function katamariAttach(K, blob) {
+  const n = K.attached.length;
+  const y = 1 - 2 * vdc(n + 1);
+  const r = Math.sqrt(Math.max(0, 1 - y * y));
+  const a = n * 2.399963;
+  const ax = Math.cos(a) * r, az = Math.sin(a) * r;
+  K.attached.push({
+    ox: blob.x, oy: blob.y, oz: blob.z,
+    s: blob.s, c: blob.c,
+    ax, ay: y, az
+  });
+  K.collected++;
+  K.totalVolume += blob.s * blob.s * blob.s;
+  K.radius = KATA.baseRadius + 0.62 * Math.cbrt(K.totalVolume);
+  return K;
+}
+
+/** pickup: collect blobs strictly smaller than the katamari radius */
+export function katamariPickup(K, blobs, hAt) {
+  const picked = [];
+  const rr = K.radius;
+  for (let i = blobs.length - 1; i >= 0; i--) {
+    const b = blobs[i];
+    const d = Math.hypot(b.x - K.pos.x, b.z - K.pos.z);
+    const touching = d < rr + b.s * 0.5;
+    const canEat = b.s < rr * 0.98;
+    if (touching && canEat) {
+      katamariAttach(K, b);
+      picked.push(b);
+      blobs.splice(i, 1);
+    }
+  }
+  return picked;
+}
+
+/* ============================================================================
    BOOT (browser only)
    ========================================================================== */
 async function main() {
@@ -1158,6 +1278,7 @@ async function main() {
     ]);
 
   const hudFps = document.getElementById('fps');
+  const hudKata = document.getElementById('kata-hud');
   const hudVox = document.getElementById('vox');
   const hudDetail = document.getElementById('vox-detail');
   const loading = document.getElementById('loading');
@@ -1220,7 +1341,171 @@ async function main() {
   let frames = 0, fpsTime = 0, elapsed = 0, degraded = false;
   const clock = new THREE.Clock();
 
-  function tick() {
+  /* ------------------------------------------------------------------ input */
+const keys = new Set();
+addEventListener('keydown', (e) => {
+  keys.add(e.code);
+  if (e.code === 'KeyK' && !document.hidden) toggleKatamari();
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code) && kata.on) e.preventDefault();
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+
+/* --------------------------------------------------------------- katamari */
+const kata = { on: false, K: null, blobs: [], blobMesh: null, blobData: null,
+  ballGroup: null, ballMesh: null, lumpMesh: null, hud: null };
+if (typeof window !== 'undefined') window.__kata = kata;   // debug/test hook
+
+function groundHAt(x, z) { return world.hAt(x, z); }
+
+function toggleKatamari() {
+  kata.on = !kata.on;
+  if (kata.on) {
+    if (!kata.K) {
+      kata.K = createKatamari((x, z) => groundHAt(Math.round(x), Math.round(z)));
+      buildKatamariMeshes();
+      spawnBlobs();
+    }
+    kata.hud = hudKata;
+    controls.enabled = false;
+    controls.autoRotate = false;
+    kata.hud.style.display = 'block';
+    document.getElementById('help').innerHTML =
+      'WASD / ARROWS · ROLL&nbsp;&nbsp;&nbsp;K · EXIT';
+    helpBackup = document.getElementById('help').innerHTML;
+  } else {
+    controls.enabled = true;
+    kata.hud.style.display = 'none';
+    document.getElementById('help').innerHTML = HELP_ORBIT_TEXT;
+  }
+}
+
+const HELP_ORBIT_TEXT = 'DRAG · ORBIT&nbsp;&nbsp;&nbsp;SCROLL · ZOOM&nbsp;&nbsp;&nbsp;IDLE · AUTO-ORBIT&nbsp;&nbsp;&nbsp;K · KATAMARI';
+document.getElementById('help').innerHTML = HELP_ORBIT_TEXT;
+let helpBackup = HELP_ORBIT_TEXT;
+
+function buildKatamariMeshes() {
+  // core ball
+  const ballGroup = new THREE.Group();
+  const ball = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 24, 18),
+    new THREE.MeshLambertMaterial({ color: 0x4a86c8 })
+  );
+  ball.castShadow = true;
+  ballGroup.add(ball);
+  // lumps: instanced boxes stuck to the surface
+  const lump = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshLambertMaterial(),
+    4096
+  );
+  lump.castShadow = true;
+  lump.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  lump.count = 0;
+  ballGroup.add(lump);
+  scene.add(ballGroup);
+  kata.ballGroup = ballGroup; kata.ballMesh = ball; kata.lumpMesh = lump;
+
+  // collectibles
+  const blobMesh = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshLambertMaterial(),
+    KATA.spawnCount
+  );
+  blobMesh.castShadow = true;
+  blobMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  scene.add(blobMesh);
+  kata.blobMesh = blobMesh;
+}
+
+const BLOB_COLORS = [0xffb03a, 0xff7043, 0xffca28, 0x8bc34a, 0x4dd0e1, 0xba68c8, 0xf06292, 0xa1887f];
+
+function spawnBlobs() {
+  kata.blobs = [];
+  const localRand = mulberry32(0x4AB10B);
+  for (let i = 0; i < KATA.spawnCount; i++) {
+    const a = localRand() * TAU, r = 5 + Math.sqrt(localRand()) * 54;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    const h = groundHAt(Math.round(x), Math.round(z));
+    if (h < 0) continue;
+    kata.blobs.push({
+      x, z, y: h + 0.5,
+      s: 0.45 + localRand() * (localRand() < 0.8 ? 0.75 : 3.2),
+      c: BLOB_COLORS[(localRand() * BLOB_COLORS.length) | 0],
+      ph: localRand() * TAU
+    });
+  }
+  kata.blobData = kata.blobs.slice();
+  const col = new THREE.Color();
+  kata.blobMesh.count = kata.blobs.length;
+  kata.blobs.forEach((b, i) => {
+    kata.blobMesh.setColorAt(i, col.setHex(b.c));
+  });
+  if (kata.blobMesh.instanceColor) kata.blobMesh.instanceColor.needsUpdate = true;
+}
+
+const _km = new THREE.Matrix4(), _kq = new THREE.Quaternion(),
+  _ke = new THREE.Euler(), _kp = new THREE.Vector3(), _ks = new THREE.Vector3();
+
+function updateKatamari(dt) {
+  if (!kata.on || !kata.K) return;
+  const K = kata.K;
+  const input = {
+    mx: (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0),
+    mz: (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0) - (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0),
+  };
+  katamariStep(K, input, (x, z) => groundHAt(x, z), dt);
+  const picked = katamariPickup(K, kata.blobs, null);
+
+  // core ball follows the sim
+  kata.ballGroup.position.set(K.pos.x, K.y, K.pos.z);
+  kata.ballGroup.rotation.y = -K.heading + Math.PI / 2;
+  kata.ballMesh.scale.setScalar(K.radius);
+  kata.ballMesh.rotation.z = -K.spin;   // rolling about travel axis
+  // lumps ride on the ball surface, rotating with it
+  const lump = kata.lumpMesh;
+  lump.count = K.attached.length;
+  for (let i = 0; i < K.attached.length; i++) {
+    const a = K.attached[i];
+    const wob = 1 + 0.06 * Math.sin(K.spin * 2 + i);
+    _ke.set(0, 0, -K.spin); _kq.setFromEuler(_ke);
+    const lx = a.ax * K.radius, ly = a.ay * K.radius, lz = a.az * K.radius;
+    _kp.set(lx, ly, lz).applyQuaternion(_kq);
+    _ks.set(a.s * wob, a.s * wob, a.s * wob);
+    _km.compose(_kp, _kq, _ks);
+    lump.setMatrixAt(i, _km);
+    lump.setColorAt(i, _kc.setHex(a.c));
+  }
+  lump.instanceMatrix.needsUpdate = true;
+  if (lump.instanceColor) lump.instanceColor.needsUpdate = true;
+
+  // blobs bob gently
+  const bm = kata.blobMesh;
+  for (let i = 0; i < kata.blobs.length; i++) {
+    const b = kata.blobs[i];
+    _kq.identity();
+    _km.compose(
+      _kp.set(b.x, b.y + 0.25 + 0.35 * Math.sin(elapsed * 2 + b.ph), b.z),
+      _kq, _ks.set(b.s, b.s, b.s)
+    );
+    bm.setMatrixAt(i, _km);
+  }
+  bm.instanceMatrix.needsUpdate = true;
+
+  // camera: chase behind the ball
+  const back = KATA.camBack + K.radius * 2.2, up = KATA.camHeight + K.radius * 1.6;
+  const cx = K.pos.x - Math.cos(K.heading) * back;
+  const cz = K.pos.z - Math.sin(K.heading) * back;
+  const gy = groundHAt(Math.round(cx), Math.round(cz));
+  camera.position.lerp(_kp.set(cx, Math.max(K.y + up, (gy > 0 ? gy : 8) + up * 0.8), cz), Math.min(1, 5 * dt));
+  camera.lookAt(K.pos.x, K.y, K.pos.z);
+
+  // HUD
+  hudKata.textContent = `R ${K.radius.toFixed(2)} · ${K.collected} eaten · ${kata.blobs.length} left`;
+}
+
+const _kc = new THREE.Color();
+
+function tick() {
     const dt = Math.min(clock.getDelta(), 0.1);
     elapsed += dt;
     if (!controls.autoRotate) {
@@ -1228,7 +1513,8 @@ async function main() {
       if (idleTimer > 3.5) controls.autoRotate = true;
     }
     updateScene(S, elapsed, dt);
-    controls.update();
+    updateKatamari(dt);
+    if (kata.on) { /* orbit controls off; camera driven by chase cam */ } else controls.update();
     composer.render();
     frames++; fpsTime += dt;
     if (fpsTime >= 0.5) {
